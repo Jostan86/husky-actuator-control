@@ -52,7 +52,7 @@ std_msgs::Int16MultiArray control_msg;
 
 
 // Actuator Parameters
-int actuator1_travel_length = 1000;                      //mm
+int actuator1_travel_length = 850;                      //mm
 int actuator2_travel_length = 350;                       //mm
 int steps_per_rev = 200;                                 //steps
 float travel_per_rev = 8.0;                              //mm
