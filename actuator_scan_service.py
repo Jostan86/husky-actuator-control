@@ -1,26 +1,44 @@
 #!/usr/bin/env python3
 import time
 import rospy
-from std_srvs.srv import Trigger, TriggerResponse
+from std_srvs.srv import Trigger
 from std_msgs.msg import Int16MultiArray
 from std_msgs.msg import Int32
 from functools import partial
 
+
+class ActuatorStatus:
+    def __init__(self, device_id, home_dist, units_per_mm=1000, friendly_id=None):
+        self.device_id = device_id
+        self.home_dist = home_dist
+        self.units_per_mm = units_per_mm
+        self.friendly_id = friendly_id or str(device_id)
+
+        # State variables
+        self.active = False
+        self.current_position = 0
+
+    @property
+    def homing_array(self):
+        return [3, self.device_id, self.home_dist, 50]
+
+    def update_active(val):
+        self.active = val
+
+    def update_position(msg):
+        self.current_position = msg.data / self.units_per_mm
+
+
+
 class ScanService:
-    default_values = {
-        1: [3, 1, 840, 50],
-        2: [3, 2, 340, 50]
-    }
     def __init__(self):
 
-        self.vert_act_enabled = 0
-        self.horz_act_enabled = 0
-        self.vert_act_position = 0
-        self.horz_act_position = 0
+        self.devices = {
+            1: ActuatorStatus(1, 840, friendly_id='V'),      # Vertical
+            2: ActuatorStatus(2, 340, friendly_id='H'),      # Horizontal
+        }
 
-        self.status_received = False
-
-        self.v
+        self.last_status_received = rospy.Time()
 
         # Actuator control publisher, sends a 4 number array, zeroth is command type, first is which actuator it's for
         # (1 for vertical actuator, 2 for horizontal actuator), second is position to move to in mm (only used for move
@@ -40,52 +58,53 @@ class ScanService:
         # means the same thing as enabled/disabled.
         self.status_sub = rospy.Subscriber('actuator_status', Int16MultiArray, self.status_callback)
 
-        # Actuator position message for vertical actuator (act1), given in number of micrometers from zero position
-        self.V_pos_sub = rospy.Subscriber('V_Actuator_position', Int32, self.update_vert_position)
-        # Actuator position message for horizontal actuator (act2), given in number of micrometers from zero position
-        self.H_pos_sub = rospy.Subscriber('H_Actuator_position', Int32, self.update_horz_position)
-
-        self.vert_scan = rospy.Service('vert_act_scan', Trigger, partial(self.handle_scan, 1))
-        self.horz_scan = rospy.Service('horz_act_scan', Trigger, partial(self.handle_scan, 2))
+        for device_id in self.devices:
+            rospy.Subscriber(f'{status.friendly_id}_Actuator_position', Int32, self.devices[device_id].update_position)
+            rospy.Service(f'scan_actuator_{status.friendly_id}', Trigger, partial(self.handle_scan, device_id))
 
 
-    def handle_scan(self, device_id, _):
-        self.status_received = False
-        array_msg = Int16MultiArray()
-        array_msg.data = [4, 0, 0, 0]
-        self.pub.publish(array_msg)
+    def request_update(self, block=True):
+        last_msg_stamp = self.last_status_received
+        msg = Int16MultiArray()
+        msg.data = [4, 0, 0, 0]
+        self.pub.publish(msg)
+        if block:
+            while self.last_status_received == last_msg_stamp:
+                rospy.sleep(0.1)
 
-        while self.status_received == False:
+    def publish_array_cmd(array):
+        cmd_msg = Int16MultiArray()
+        cmd_msg.data = array
+        self.pub.publish(cmd_msg)
+
+    def await_device_threshold(device_id, dist, more_than=True):
+        while True:
+            if more_than:
+                cond = self.devices[device_id].current_position > dist
+            else:
+                cond = self.devices[device_id].current_position < dist
+            if cond:
+                return
             rospy.sleep(0.1)
 
-        data = self.default_values[device_id]
+    def handle_scan(self, device_id, _):
 
-        if self.status_received and self.vert_act_enabled:
-            array_msg = Int16MultiArray()
-            array_msg.data = data
-            self.pub.publish(array_msg)
+        self.request_update(block=True)
+        device = self.devices[device_id]
+        if not device.active:
+            return False, 'Device is not active'
 
-            while self.horz_act_position < 840000:
-                rospy.sleep(.1)
+        # Forward
+        self.publish_array_cmd([3, device_id, device.home_dist, 50])
+        self.await_device_threshold(device_id, device.home_dist, more_than=True)
 
-            array_msg = Int16MultiArray()
-            array_msg.data = [3, 1, 10, 50]
-            self.pub.publish(array_msg)
+        # Backwards
+        reverse_thres = 10
+        self.publish_array_cmd([3, device_id, reverse_thres, 50])
+        self.await_device_threshold(device_id, reverse_thres, more_than=False)
 
-            while self.horz_act_position > 10000:
-                rospy.sleep(.1)
+        return True, "Scan complete"
 
-            result = "Scan complete"
-            success = True
-            return success, result
-
-        else:
-            result = "Actuator Disabled"
-            success = False
-            return success, result
-
-    def handle_horz_scan(self, req):
-        ...
 
     def status_callback(self, status_msg):
         # Callback for updating status of actuators based on status message from arduino, the first number
@@ -93,32 +112,12 @@ class ScanService:
         # they just tell the program whether the acuators are enabled. This is helpful to figure out when it has
         # successfully homed itself, and for determining the state of the actuators when this program is started.
         status_info = status_msg.data
-        # If act1 sends a message that it's disabled
-        if status_info[1] == 0:
-            self.vert_act_enabled = False
-        else:
-        # If act1 sends a message that it's enabled
-            self.vert_act_enabled = True
 
-        if status_info[2] == 0:
-            # If act2 sends a message that it's disabled, update that flag and set the enable/disable button to enable
-            self.horz_act_enabled = False
-        else:
-            # If act2 sends a message that it's enabled, update that flag and set the enable/disable button to disable
-            self.horz_act_enabled = True
+        # TODO: This is hardcoded, could theoretically be made more general
+        self.devices[1].update_active(bool(status_info[1]))
+        self.devices[2].update_active(bool(status_info[2]))
 
-        self.status_received = True
-
-    def update_horz_position(self, horz_position_msg):
-        # Callback for receiving position message for horizontal actuator (act2)
-        self.horz_act_position = horz_position_msg.data
-
-
-    def update_vert_position(self, vert_position_msg):
-        # Callback for recieving position message for vertical actuator (act1)
-        self.vert_act_position = vert_position_msg.data
-
-
+        self.last_status_received = rospy.Time.now()
 
 
 if __name__ == "__main__":
